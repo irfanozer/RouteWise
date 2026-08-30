@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "routewise-backend"
+version = "0.1.0"
+description = "Deterministic disruption-aware routing for the fictional Metrovale transit network"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic==1.19.1",
+  "asyncpg==0.31.0",
+  "fastapi==0.141.1",
+  "pydantic-settings==2.15.0",
+  "sqlalchemy[asyncio]==2.0.52",
+  "uvicorn[standard]==0.52.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "aiosqlite==0.22.1",
+  "httpx==0.28.1",
+  "mypy==1.20.2",
+  "pytest==8.4.2",
+  "pytest-asyncio==0.26.0",
+  "ruff==0.16.5",
+]
+
+[project.scripts]
+routewise-api = "routewise.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/routewise"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["routewise"]

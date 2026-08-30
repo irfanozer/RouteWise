@@ -1,0 +1,84 @@
+name: routewise
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-routewise}
+      POSTGRES_USER: ${POSTGRES_USER:-routewise}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-routewise-local-only}
+    ports:
+      - "127.0.0.1:${ROUTEWISE_POSTGRES_PORT:-5436}:5432"
+    volumes:
+      - routewise-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - routewise
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      ROUTEWISE_ENVIRONMENT: local-compose
+      ROUTEWISE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-routewise}:${POSTGRES_PASSWORD:-routewise-local-only}@postgres:5432/${POSTGRES_DB:-routewise}
+      ROUTEWISE_CORS_ORIGINS: '${ROUTEWISE_CORS_ORIGINS:-["http://localhost:3003","http://127.0.0.1:3003"]}'
+      ROUTEWISE_AUTO_CREATE_SCHEMA: "false"
+      ROUTEWISE_MAX_ROUTE_RUNS: "5000"
+    ports:
+      - "127.0.0.1:${ROUTEWISE_BACKEND_PORT:-8004}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - routewise
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      API_UPSTREAM: http://backend:8000
+    ports:
+      - "127.0.0.1:${ROUTEWISE_FRONTEND_PORT:-3003}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - routewise
+
+volumes:
+  routewise-postgres-data:
+    name: routewise-postgres-data
+
+networks:
+  routewise:
+    name: routewise-network
