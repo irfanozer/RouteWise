@@ -12,14 +12,14 @@ if ($web.StatusCode -ne 200) {
 }
 
 Write-Host "Checking production browser security headers..."
-$home = Invoke-WebRequest -Uri "$BaseUrl/" -UseBasicParsing -TimeoutSec 15
+$homepageResponse = Invoke-WebRequest -Uri "$BaseUrl/" -UseBasicParsing -TimeoutSec 15
 $requiredHeaders = @{
     "Content-Security-Policy" = "default-src"
     "X-Content-Type-Options" = "nosniff"
     "X-Frame-Options" = "DENY"
 }
 foreach ($headerName in $requiredHeaders.Keys) {
-    $headerValue = [string]$home.Headers[$headerName]
+    $headerValue = [string]$homepageResponse.Headers[$headerName]
     if (-not $headerValue -or -not $headerValue.Contains($requiredHeaders[$headerName])) {
         throw "Frontend response is missing the expected $headerName security header."
     }
