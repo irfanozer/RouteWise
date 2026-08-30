@@ -7,8 +7,9 @@
 
 Both application templates default to one minimum replica. The web container
 proxies browser API requests to the internal API; the API is not public.
-The application and migration templates accept a GitHub Container Registry
-username and package-read token so images do not have to be public.
+The application and migration templates expect immutable public GitHub
+Container Registry images. They intentionally contain no GHCR username,
+password, or registry secret; Azure pulls the images anonymously.
 
 No template is applied automatically just because it exists in the repository.
 The first-deployment decisions and unset credentials are documented in

@@ -1,9 +1,10 @@
 # Deployment handoff
 
 RouteWise is release-ready for Azure Container Apps. Complete the local checks
-first. The repository does not create cloud resources, publish packages, change
-DNS, or bind a certificate until the owner explicitly runs the setup commands
-and enables deployment.
+first. After the repository is pushed, successful CI publishes the two
+application packages. The repository does not create cloud resources, change
+DNS, bind a certificate, or deploy an application until the owner explicitly
+runs the setup commands and enables deployment.
 
 ## Production shape
 
@@ -12,7 +13,7 @@ and enables deployment.
 - one private PostgreSQL Flexible Server;
 - one Container Apps environment connected to a virtual network;
 - GitHub Actions OIDC, with no stored Azure client secret;
-- authenticated pulls from GitHub Container Registry;
+- anonymous pulls of public immutable images from GitHub Container Registry;
 - an optional Cloudflare hostname and Azure managed TLS certificate.
 
 The API keeps at most 5,000 route receipts. This protects the public demo from
@@ -55,38 +56,41 @@ git push -u origin main
 The `OWNER/REPOSITORY` value used by the setup scripts is
 `irfanozer/route-wise`.
 
-## 3. Prepare access without passwords in the workflow
+## 3. Publish the application images and make them public
 
-Install and sign in to Azure CLI and GitHub CLI, then select the intended Azure
-subscription. The setup scripts require permission to create a resource group,
-network, PostgreSQL server, Container Apps environment, Entra application, and
-one resource-group-scoped Contributor assignment.
+After CI succeeds on `main`, **Publish images and deploy production** publishes
+these packages while Azure deployment remains disabled:
 
-The application images can remain private. In GitHub, open **Settings >
-Developer settings > Personal access tokens > Tokens (classic)** and create a
-classic token with only `read:packages`. GitHub's Container registry currently
-requires the classic token type for this use. Then save it as this repository
-secret:
+- `ghcr.io/irfanozer/route-wise-backend:<commit-sha>`;
+- `ghcr.io/irfanozer/route-wise-frontend:<commit-sha>`.
+
+If the image workflow does not start automatically, run it once while
+deployment is still disabled:
 
 ```powershell
-$token = Read-Host "GitHub package-read token" -AsSecureString
-$credential = [System.Net.NetworkCredential]::new("", $token)
-$credential.Password | gh secret set ROUTEWISE_GHCR_PULL_TOKEN --repo irfanozer/route-wise
-$credential = $null
-$token = $null
+gh workflow run deploy-production.yml `
+  --repo irfanozer/route-wise `
+  --ref main
 ```
 
-The token needs package read access only. It does not need repository write or
-Azure access. Do not paste it into a committed file, command history, Bicep
-parameter file, or Container App environment variable.
+Open each package under the repository or profile **Packages** section. Select
+**Package settings > Danger Zone > Change package visibility > Public**, then
+confirm the package name. Repository visibility and package visibility are
+separate, so a public repository does not automatically make these packages
+public. This visibility change is one-time and cannot be reversed.
 
-See GitHub's [Container registry authentication documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
-for the current token requirements.
+Azure then pulls the images anonymously. No GitHub password or permanent
+container-registry token is stored in GitHub or Azure. See GitHub's
+[package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+for the current public-package behavior.
 
 ## 4. Create the Azure foundation
 
 This is the first billable step. Review the selected region and subscription,
-then run from the repository root:
+install and sign in to Azure CLI and GitHub CLI, then run from the repository
+root. The setup requires permission to create a resource group, network,
+PostgreSQL server, Container Apps environment, Entra application, and one
+resource-group-scoped Contributor assignment.
 
 ```powershell
 ./scripts/azure/bootstrap-foundation.ps1 `
@@ -123,8 +127,7 @@ Azure identity variables used by the workflow.
 Review the repository settings before enabling the workflow:
 
 - `ROUTEWISE_DATABASE_URL` exists as a secret and contains `ssl=require`;
-- `ROUTEWISE_GHCR_PULL_TOKEN` exists as a secret;
-- `ROUTEWISE_GHCR_PULL_USERNAME` matches the canonical GitHub owner;
+- both `route-wise-backend` and `route-wise-frontend` packages are public;
 - the Azure client, tenant, subscription, resource group, and environment
   variables are populated;
 - the `production` GitHub environment is the environment used by the OIDC

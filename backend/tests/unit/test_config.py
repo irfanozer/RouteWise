@@ -5,8 +5,12 @@ from pydantic import ValidationError
 from routewise.config import Settings, alembic_database_url
 
 
-def test_default_database_uses_reserved_local_postgres_port() -> None:
-    assert "@localhost:5436/routewise" in Settings().database_url
+def test_default_database_uses_reserved_local_postgres_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ROUTEWISE_DATABASE_URL", raising=False)
+
+    assert "@localhost:5436/routewise" in Settings(_env_file=None).database_url
 
 
 def test_cors_origins_accept_csv_and_json() -> None:

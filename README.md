@@ -136,9 +136,10 @@ repository variables, and production secrets are intentionally not created by
 this repository.
 
 The production workflow is also inert until the repository variable
-`AZURE_DEPLOYMENT_ENABLED` is explicitly set to `true`. Private GHCR packages
-are supported through a package-read credential; making application images
-public is not required.
+`AZURE_DEPLOYMENT_ENABLED` is explicitly set to `true`. Successful CI on `main`
+can publish the immutable backend and frontend images while deployment remains
+disabled. Both GHCR packages must be made public once so Azure can pull them
+anonymously without a stored GitHub credential.
 
 ## Safety and scope
 

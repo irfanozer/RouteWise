@@ -16,24 +16,16 @@ param environmentName string = 'prod'
 param containerAppsEnvironmentName string = 'cae-${toLower(namePrefix)}-${toLower(environmentName)}'
 
 @minLength(1)
+@description('Immutable public GHCR frontend image tag or digest.')
 param frontendImage string
 
 @minLength(1)
+@description('Immutable public GHCR backend image tag or digest.')
 param backendImage string
 
 @secure()
 @minLength(1)
 param databaseUrl string
-
-@minLength(1)
-param registryServer string = 'ghcr.io'
-
-@minLength(1)
-param registryUsername string
-
-@secure()
-@minLength(1)
-param registryPassword string
 
 @description('Optional custom hostname for the public web app. Supply it with its certificate ID.')
 param webCustomDomainName string = ''
@@ -107,17 +99,6 @@ resource apiApp 'Microsoft.App/containerApps@2026-01-01' = {
         {
           name: 'database-url'
           value: databaseUrl
-        }
-        {
-          name: 'registry-password'
-          value: registryPassword
-        }
-      ]
-      registries: [
-        {
-          server: registryServer
-          username: registryUsername
-          passwordSecretRef: 'registry-password'
         }
       ]
     }
@@ -232,19 +213,6 @@ resource webApp 'Microsoft.App/containerApps@2026-01-01' = {
     configuration: {
       activeRevisionsMode: 'Single'
       maxInactiveRevisions: 3
-      secrets: [
-        {
-          name: 'registry-password'
-          value: registryPassword
-        }
-      ]
-      registries: [
-        {
-          server: registryServer
-          username: registryUsername
-          passwordSecretRef: 'registry-password'
-        }
-      ]
       ingress: {
         allowInsecure: false
         customDomains: webCustomDomains

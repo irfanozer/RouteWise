@@ -16,21 +16,12 @@ param environmentName string = 'prod'
 param containerAppsEnvironmentName string = 'cae-${toLower(namePrefix)}-${toLower(environmentName)}'
 
 @minLength(1)
+@description('Immutable public GHCR backend image tag or digest.')
 param backendImage string
 
 @secure()
 @minLength(1)
 param databaseUrl string
-
-@minLength(1)
-param registryServer string = 'ghcr.io'
-
-@minLength(1)
-param registryUsername string
-
-@secure()
-@minLength(1)
-param registryPassword string
 
 param tags object = {}
 
@@ -65,17 +56,6 @@ resource migrationJob 'Microsoft.App/jobs@2025-07-01' = {
         {
           name: 'database-url'
           value: databaseUrl
-        }
-        {
-          name: 'registry-password'
-          value: registryPassword
-        }
-      ]
-      registries: [
-        {
-          server: registryServer
-          username: registryUsername
-          passwordSecretRef: 'registry-password'
         }
       ]
     }

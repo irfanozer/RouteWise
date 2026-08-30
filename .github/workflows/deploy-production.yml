@@ -17,11 +17,10 @@ jobs:
   images:
     name: Publish immutable images
     if: >-
-      vars.AZURE_DEPLOYMENT_ENABLED == 'true' &&
-      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-       (github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main'))
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -139,9 +138,6 @@ jobs:
       CUSTOM_DOMAIN: ${{ vars.ROUTEWISE_CUSTOM_DOMAIN || 'routewise.irfanburakozer.com' }}
       REQUIRE_CUSTOM_DOMAIN: ${{ vars.ROUTEWISE_REQUIRE_CUSTOM_DOMAIN || 'false' }}
       DATABASE_URL: ${{ secrets.ROUTEWISE_DATABASE_URL }}
-      REGISTRY_SERVER: ghcr.io
-      REGISTRY_USERNAME: ${{ vars.ROUTEWISE_GHCR_PULL_USERNAME || github.repository_owner }}
-      REGISTRY_PASSWORD: ${{ secrets.ROUTEWISE_GHCR_PULL_TOKEN }}
       BACKEND_IMAGE: ${{ needs.images.outputs.backend_image }}
       FRONTEND_IMAGE: ${{ needs.images.outputs.frontend_image }}
     steps:
@@ -158,13 +154,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in RESOURCE_GROUP CONTAINER_APPS_ENVIRONMENT DATABASE_URL REGISTRY_USERNAME REGISTRY_PASSWORD AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+          for name in RESOURCE_GROUP CONTAINER_APPS_ENVIRONMENT DATABASE_URL AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
             if [[ -z "${!name:-}" ]]; then
               echo "Required production setting $name is missing." >&2
               exit 1
             fi
           done
           [[ "$DATABASE_URL" == *"ssl=require"* ]]
+
+      - name: Verify images allow anonymous pulls
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in "$BACKEND_IMAGE" "$FRONTEND_IMAGE"; do
+            if ! docker manifest inspect "$image" > /dev/null; then
+              echo "Cannot pull $image anonymously. Make both RouteWise packages public in GitHub before deployment." >&2
+              exit 1
+            fi
+          done
 
       - name: Sign in to Azure with GitHub OIDC
         uses: azure/login@4c03e4685fe81df2c50d5714c7d93cf39d8deb7f # v3
@@ -222,9 +229,6 @@ jobs:
               containerAppsEnvironmentName="$CONTAINER_APPS_ENVIRONMENT" \
               backendImage="$BACKEND_IMAGE" \
               databaseUrl="$DATABASE_URL" \
-              registryServer="$REGISTRY_SERVER" \
-              registryUsername="$REGISTRY_USERNAME" \
-              registryPassword="$REGISTRY_PASSWORD" \
             --query properties.outputs.migrationJobName.value \
             --output tsv \
             --only-show-errors)"
@@ -286,9 +290,6 @@ jobs:
               frontendImage="$FRONTEND_IMAGE" \
               backendImage="$BACKEND_IMAGE" \
               databaseUrl="$DATABASE_URL" \
-              registryServer="$REGISTRY_SERVER" \
-              registryUsername="$REGISTRY_USERNAME" \
-              registryPassword="$REGISTRY_PASSWORD" \
               browserCustomDomainName="$CUSTOM_DOMAIN" \
               webCustomDomainName="${{ steps.custom_domain.outputs.domain_name }}" \
               webCustomDomainCertificateId="${{ steps.custom_domain.outputs.certificate_id }}" \
@@ -372,9 +373,6 @@ jobs:
               frontendImage="$PREVIOUS_FRONTEND_IMAGE" \
               backendImage="$PREVIOUS_BACKEND_IMAGE" \
               databaseUrl="$DATABASE_URL" \
-              registryServer="$REGISTRY_SERVER" \
-              registryUsername="$REGISTRY_USERNAME" \
-              registryPassword="$REGISTRY_PASSWORD" \
               browserCustomDomainName="$CUSTOM_DOMAIN" \
               webCustomDomainName="${{ steps.custom_domain.outputs.domain_name }}" \
               webCustomDomainCertificateId="${{ steps.custom_domain.outputs.certificate_id }}" \

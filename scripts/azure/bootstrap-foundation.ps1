@@ -149,7 +149,6 @@ gh variable set AZURE_ENVIRONMENT_NAME --repo $repository --body $EnvironmentNam
 gh variable set AZURE_CONTAINER_APPS_ENVIRONMENT --repo $repository --body $outputs.containerAppsEnvironmentName.value
 gh variable set ROUTEWISE_CUSTOM_DOMAIN --repo $repository --body $CustomDomain
 gh variable set ROUTEWISE_REQUIRE_CUSTOM_DOMAIN --repo $repository --body "false"
-gh variable set ROUTEWISE_GHCR_PULL_USERNAME --repo $repository --body $canonicalOwner
 gh variable set AZURE_DEPLOYMENT_ENABLED --repo $repository --body "false"
 
 $plainPassword = $null
