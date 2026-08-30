@@ -44,32 +44,32 @@ Run:
 
 ```powershell
 gh auth login --hostname github.com --git-protocol https --web
-gh repo create irfanozer/route-wise --public --description "Disruption-aware transit routing demo"
+gh repo create irfanozer/RouteWise --public --description "Disruption-aware transit routing demo"
 git init
 git add .
 git commit -m "Build RouteWise disruption-aware routing demo"
 git branch -M main
-git remote add origin https://github.com/irfanozer/route-wise.git
+git remote add origin https://github.com/irfanozer/RouteWise.git
 git push -u origin main
 ```
 
 The `OWNER/REPOSITORY` value used by the setup scripts is
-`irfanozer/route-wise`.
+`irfanozer/RouteWise`.
 
 ## 3. Publish the application images and make them public
 
 After CI succeeds on `main`, **Publish images and deploy production** publishes
 these packages while Azure deployment remains disabled:
 
-- `ghcr.io/irfanozer/route-wise-backend:<commit-sha>`;
-- `ghcr.io/irfanozer/route-wise-frontend:<commit-sha>`.
+- `ghcr.io/irfanozer/routewise-backend:<commit-sha>`;
+- `ghcr.io/irfanozer/routewise-frontend:<commit-sha>`.
 
 If the image workflow does not start automatically, run it once while
 deployment is still disabled:
 
 ```powershell
 gh workflow run deploy-production.yml `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --ref main
 ```
 
@@ -95,7 +95,7 @@ resource-group-scoped Contributor assignment.
 ```powershell
 ./scripts/azure/bootstrap-foundation.ps1 `
   -SubscriptionId "YOUR_AZURE_SUBSCRIPTION_ID" `
-  -GitHubRepository "irfanozer/route-wise" `
+  -GitHubRepository "irfanozer/RouteWise" `
   -ConfirmCosts
 ```
 
@@ -113,7 +113,7 @@ Azure pricing calculator before running the command.
 ```powershell
 ./scripts/azure/configure-github-oidc.ps1 `
   -SubscriptionId "YOUR_AZURE_SUBSCRIPTION_ID" `
-  -GitHubRepository "irfanozer/route-wise"
+  -GitHubRepository "irfanozer/RouteWise"
 ```
 
 The script reads GitHub's canonical owner and repository IDs and uses them in
@@ -127,7 +127,7 @@ Azure identity variables used by the workflow.
 Review the repository settings before enabling the workflow:
 
 - `ROUTEWISE_DATABASE_URL` exists as a secret and contains `ssl=require`;
-- both `route-wise-backend` and `route-wise-frontend` packages are public;
+- both `routewise-backend` and `routewise-frontend` packages are public;
 - the Azure client, tenant, subscription, resource group, and environment
   variables are populated;
 - the `production` GitHub environment is the environment used by the OIDC
@@ -138,10 +138,10 @@ the first release:
 
 ```powershell
 gh variable set AZURE_DEPLOYMENT_ENABLED `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --body true
 gh workflow run deploy-production.yml `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --ref main
 ```
 
@@ -167,15 +167,22 @@ Use the generated Azure hostname for the first release. Then add
 will show the exact CNAME and ownership-verification TXT records to create in
 Cloudflare.
 
+Print those records after the first Azure deployment:
+
+```powershell
+./scripts/azure/show-domain-records.ps1 `
+  -SubscriptionId "YOUR_AZURE_SUBSCRIPTION_ID"
+```
+
 Keep the CNAME **DNS only** while Azure validates and issues the managed
 certificate. After Azure shows an SNI certificate binding, set:
 
 ```powershell
 gh variable set ROUTEWISE_CUSTOM_DOMAIN `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --body routewise.irfanburakozer.com
 gh variable set ROUTEWISE_REQUIRE_CUSTOM_DOMAIN `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --body true
 ```
 
@@ -190,7 +197,7 @@ Disable releases without deleting anything:
 
 ```powershell
 gh variable set AZURE_DEPLOYMENT_ENABLED `
-  --repo irfanozer/route-wise `
+  --repo irfanozer/RouteWise `
   --body false
 ```
 

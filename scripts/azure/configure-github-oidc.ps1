@@ -26,7 +26,7 @@ foreach ($command in @("az", "gh")) {
 gh auth status | Out-Null
 $requestedParts = $GitHubRepository.Split('/', 2)
 if ($requestedParts.Count -ne 2) {
-    throw "-GitHubRepository must use OWNER/REPOSITORY format, for example irfanozer/route-wise."
+    throw "-GitHubRepository must use OWNER/REPOSITORY format, for example irfanozer/RouteWise."
 }
 
 $repositoryMetadata = (gh api "repos/$GitHubRepository") | ConvertFrom-Json
@@ -106,4 +106,3 @@ gh variable set AZURE_SUBSCRIPTION_ID --repo $repository --body $SubscriptionId
 
 Write-Host "GitHub OIDC is ready. No Azure client secret was created." -ForegroundColor Green
 Write-Host "Federated subject: $subject"
-

@@ -56,7 +56,7 @@ gh auth status | Out-Null
 
 $repositoryParts = $GitHubRepository.Split('/', 2)
 if ($repositoryParts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($repositoryParts[0]) -or [string]::IsNullOrWhiteSpace($repositoryParts[1])) {
-    throw "-GitHubRepository must use OWNER/REPOSITORY format, for example irfanozer/route-wise."
+    throw "-GitHubRepository must use OWNER/REPOSITORY format, for example irfanozer/RouteWise."
 }
 $repositoryMetadataJson = gh api "repos/$GitHubRepository"
 if ($LASTEXITCODE -ne 0 -or -not $repositoryMetadataJson) {
