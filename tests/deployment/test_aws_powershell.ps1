@@ -145,3 +145,5 @@ finally {
 
 Write-Host "Passed: $script:Passed. Failed: $script:Failed."
 if ($script:Failed -gt 0) { exit 1 }
+# Expected native failures must not become GitHub Actions' final step exit code.
+exit 0
