@@ -118,6 +118,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component boundaries and
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the Azure deployment and custom
 domain handoff.
 
+An independent [AWS deployment guide](docs/AWS_DEPLOYMENT.md) is also included.
+It uses CloudFormation, private S3, CloudFront, and a continuously running EC2
+host with Docker, PostgreSQL, and GitHub OIDC releases. The Azure infrastructure
+and workflow remain available and are not replaced by the AWS setup.
+
 ## Development checks
 
 ```powershell

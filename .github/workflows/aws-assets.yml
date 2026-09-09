@@ -1,0 +1,93 @@
+name: AWS deployment assets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: routewise-aws-assets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate AWS templates and deployment safeguards
+    runs-on: ubuntu-latest
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install template validation tools
+        run: python -m pip install "cfn-lint>=1,<2" "PyYAML>=6,<7"
+
+      - name: Validate CloudFormation
+        run: cfn-lint infra/aws/foundation.yaml
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in scripts/aws/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem scripts/aws -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref] $tokens,
+              [ref] $parseErrors
+            ) | Out-Null
+            $errors += $parseErrors
+          }
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
+      - name: Verify deployment safeguards
+        run: python -m unittest discover -s tests/deployment -v
+
+      - name: Validate proxy configurations without AWS access
+        shell: bash
+        env:
+          # Synthetic configuration only; this job needs no deployment secrets.
+          BACKEND_IMAGE: ghcr.io/irfanozer/routewise-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          POSTGRES_PASSWORD: "00000000000000000000000000000000"
+          ORIGIN_DOMAIN: origin.example.com
+          ORIGIN_VERIFY_TOKEN: "00000000000000000000000000000000"
+        run: |
+          set -euo pipefail
+          docker compose --file infra/aws/compose.yaml config --quiet
+          caddy_image=$(python -c 'import yaml; print(yaml.safe_load(open("infra/aws/compose.yaml"))["services"]["caddy"]["image"])')
+          nginx_image=$(python -c 'import yaml; print(yaml.safe_load(open("infra/aws/compose.yaml"))["services"]["api-proxy"]["image"])')
+          docker pull "$caddy_image"
+          docker pull "$nginx_image"
+          # Configuration processes have no network, so they cannot contact ACME,
+          # an application/database, AWS, or any other external service.
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=16m --tmpfs /data:size=16m --tmpfs /config:size=4m \
+            --env ORIGIN_DOMAIN --env ORIGIN_VERIFY_TOKEN \
+            --mount "type=bind,source=$PWD/infra/aws/Caddyfile,target=/etc/caddy/Caddyfile,readonly" \
+            "$caddy_image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=16m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges:true --entrypoint nginx \
+            --mount "type=bind,source=$PWD/infra/aws/api-proxy.conf,target=/etc/nginx/nginx.conf,readonly" \
+            "$nginx_image" -t

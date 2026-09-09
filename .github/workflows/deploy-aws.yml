@@ -1,0 +1,96 @@
+name: Deploy RouteWise to AWS
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: routewise-aws-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      vars.AWS_DEPLOYMENT_ENABLED == 'true' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.id == github.repository_id))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: aws-production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME || 'routewise-aws-prod' }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Require successful checks on this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          for workflow in ci.yml aws-assets.yml; do
+            ready=false
+            for attempt in {1..60}; do
+              runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$RELEASE_SHA&per_page=100")"
+              if jq -e '[.workflow_runs[] | select(.head_branch == "main" and .event == "push" and .conclusion == "success")] | length > 0' <<< "$runs" > /dev/null; then
+                ready=true
+                break
+              fi
+              sleep 5
+            done
+            if [[ "$ready" != true ]]; then
+              echo "No successful main-branch push run of $workflow for $RELEASE_SHA. Push this commit and let CI finish." >&2
+              exit 1
+            fi
+          done
+
+      - name: Check out the verified release
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          persist-credentials: false
+
+      - name: Sign in to AWS using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: routewise-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Deploy immutable containers and the matching frontend
+        id: release
+        run: python3 scripts/aws/deploy-from-ci.py
+
+      - name: Verify the complete AWS demo
+        shell: pwsh
+        env:
+          AWS_PREVIEW_URL: ${{ steps.release.outputs.preview_url }}
+        run: ./scripts/check-local.ps1 -BaseUrl $env:AWS_PREVIEW_URL
+
+      - name: Show deployment address
+        env:
+          PREVIEW_URL: ${{ steps.release.outputs.preview_url }}
+        run: |
+          {
+            echo "### RouteWise on AWS"
+            echo ""
+            echo "Verified release: \`$RELEASE_SHA\`"
+            echo ""
+            echo "[Open AWS deployment]($PREVIEW_URL)"
+            echo ""
+            echo "Azure resources and public DNS were not changed."
+          } >> "$GITHUB_STEP_SUMMARY"

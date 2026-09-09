@@ -1,0 +1,54 @@
+{
+	admin 127.0.0.1:2019
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	auto_https disable_redirects
+	# Proxy errors can include request headers even with access logging disabled.
+	# Remove those fields before writing any runtime log containing the token.
+	log default {
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+			}
+		}
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Caddy intercepts its HTTP-01 ACME challenges before application routes.
+# Other plaintext requests never reach the application or receive its token.
+http://{$ORIGIN_DOMAIN} {
+	respond "Forbidden" 403
+}
+
+https://{$ORIGIN_DOMAIN} {
+	tls {
+		issuer acme {
+			# Only CloudFront can reach port 443, so use public port 80 for ACME.
+			disable_tlsalpn_challenge
+		}
+	}
+
+	header Cache-Control "no-store"
+	request_body {
+		max_size 32768
+	}
+
+	# A literal hex token is an exact header match, with no wildcard expansion.
+	# Keep health endpoints inside this guard as well as every API route.
+	@cloudfront header X-RouteWise-Origin-Token {$ORIGIN_VERIFY_TOKEN}
+	handle @cloudfront {
+		reverse_proxy api-proxy:8080 {
+			# CloudFront generates this header; the origin request policy includes
+			# it. Overwrite any similarly named header supplied by a viewer.
+			header_up X-RouteWise-Viewer-Address {http.request.header.CloudFront-Viewer-Address}
+			header_up -X-RouteWise-Origin-Token
+			header_down Cache-Control "no-store"
+		}
+	}
+	handle {
+		respond "Forbidden" 403
+	}
+}

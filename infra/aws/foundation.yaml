@@ -1,0 +1,946 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  RouteWise portfolio deployment: private S3 and CloudFront, with one EC2 host
+  for Caddy, the API, and PostgreSQL. Deploy in us-east-1 using bootstrap.
+  This is a cost-conscious single-host deployment, not a highly available service.
+
+# No NAT gateway, load balancer, RDS, or CloudFront flat-rate subscription.
+# EC2, the public IPv4 address, EBS, snapshots, S3, and traffic can incur charges.
+# Standard CPU credits prevent T3 surplus-credit charges; sustained load can throttle.
+# Instance replacement and host failure cause downtime. Database recovery requires
+# the retained volume/snapshot or a verified backup; snapshots are not SQL backups.
+# The bootstrap creates the two SSM SecureString parameters outside CloudFormation.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: irfanozer/RouteWise
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+    Description: Case-sensitive GitHub owner/repository used by the deployment workflow.
+  GitHubOwnerId:
+    Type: String
+    AllowedPattern: '[0-9]+'
+    Description: Immutable numeric GitHub repository-owner ID, resolved by bootstrap.
+  GitHubRepositoryId:
+    Type: String
+    AllowedPattern: '[0-9]+'
+    Description: Immutable numeric GitHub repository ID, resolved by bootstrap.
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com)'
+    Description: Reuse this account's GitHub OIDC provider, or leave empty to create one.
+  EnvironmentName:
+    Type: String
+    Default: aws-production
+    AllowedPattern: '[A-Za-z0-9_-]+'
+    Description: Exact GitHub Actions environment required by the role trust policy.
+  OriginDomain:
+    Type: String
+    AllowedPattern: '([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}'
+    MaxLength: 253
+    Description: DNS-only origin hostname whose A record points at PublicIp; used by Caddy for HTTPS.
+  WebCustomDomain:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63})'
+    MaxLength: 253
+    Description: Optional public frontend hostname; requires a matching WebCertificateArn.
+  WebCertificateArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|arn:aws:acm:us-east-1:[0-9]{12}:certificate/[a-f0-9-]+)'
+    Description: Optional issued ACM certificate in us-east-1 matching WebCustomDomain.
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: 'pl-[a-f0-9]+'
+    Description: Regional com.amazonaws.global.cloudfront.origin-facing AWS-managed prefix-list ID.
+  OriginVerifyToken:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    MaxLength: 128
+    AllowedPattern: '[A-Za-z0-9_-]+'
+    Description: Bootstrap-generated origin guard, also saved as /routewise/prod/origin-token SecureString.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 x86_64 AMI. Bootstrap resolves the public latest-AMI SSM
+      parameter on creation and preserves this ID on updates. Change the ID only
+      during planned instance replacement and runtime redeployment.
+  BackupRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 7
+    MaxValue: 90
+    Description: S3 lifecycle retention for SQL backup objects and their noncurrent versions.
+
+Rules:
+  CustomDomainRequiresCertificate:
+    Assertions:
+      - Assert:
+          Fn::Or:
+            - Fn::And:
+                - Fn::Equals:
+                    - Ref: WebCustomDomain
+                    - ''
+                - Fn::Equals:
+                    - Ref: WebCertificateArn
+                    - ''
+            - Fn::And:
+                - Fn::Not:
+                    - Fn::Equals:
+                        - Ref: WebCustomDomain
+                        - ''
+                - Fn::Not:
+                    - Fn::Equals:
+                        - Ref: WebCertificateArn
+                        - ''
+        AssertDescription: WebCustomDomain and WebCertificateArn must both be supplied or both be empty.
+
+Conditions:
+  CreateGitHubOidcProvider:
+    Fn::Equals:
+      - Ref: ExistingGitHubOidcProviderArn
+      - ''
+  HasWebCustomDomain:
+    Fn::And:
+      - Fn::Not:
+          - Fn::Equals:
+              - Ref: WebCustomDomain
+              - ''
+      - Fn::Not:
+          - Fn::Equals:
+              - Ref: WebCertificateArn
+              - ''
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.82.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-vpc'
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: Vpc
+      InternetGatewayId:
+        Ref: InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: Vpc
+      CidrBlock: 10.82.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-public'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      SubnetId:
+        Ref: PublicSubnet
+  RuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from CloudFront only; HTTP for ACME HTTP-01; administration through SSM.
+      VpcId:
+        Ref: Vpc
+      SecurityGroupIngress:
+        # This AWS-managed prefix list consumes 55 security-group rule slots.
+        - Description: CloudFront origin HTTPS; Caddy also checks the secret origin header.
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourcePrefixListId:
+            Ref: CloudFrontPrefixListId
+        - Description: ACME HTTP-01 challenges; Caddy must not serve the API over HTTP.
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: Public AWS APIs, package/image registries, and certificate renewal.
+          IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-runtime'
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TrimOldFrontendVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+  ReleaseBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Release archives contain application artifacts, never the live database.
+          - Id: ExpireReleaseArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDatabaseBackups
+            Status: Enabled
+            ExpirationInDays:
+              Ref: BackupRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays:
+                Ref: BackupRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+  ReleaseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: ReleaseBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt: [ReleaseBucket, Arn]
+              - Fn::Sub: '${ReleaseBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt: [BackupBucket, Arn]
+              - Fn::Sub: '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: RouteWise host management, release downloads, and backup uploads.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: RouteWiseRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadReleaseObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  Fn::Sub: '${ReleaseBucket.Arn}/*'
+              - Sid: ListReleaseArtifacts
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt: [ReleaseBucket, Arn]
+              - Sid: UploadBackups
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  Fn::Sub: '${BackupBucket.Arn}/*'
+              - Sid: LocateBackupBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt: [BackupBucket, Arn]
+              - Sid: ReadRuntimeSecrets
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - Fn::Sub: 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/routewise/prod/database-password'
+                  - Fn::Sub: 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/routewise/prod/origin-token'
+              # The AWS SSM core policy includes GetParameters on '*'. Restrict
+              # parameter-value reads explicitly while retaining agent operations.
+              - Sid: DenyOtherParameterValues
+                Effect: Deny
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParameterHistory
+                  - ssm:GetParametersByPath
+                NotResource:
+                  - Fn::Sub: 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/routewise/prod/database-password'
+                  - Fn::Sub: 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/routewise/prod/origin-token'
+  RuntimeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: RuntimeRole
+  RuntimeInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetRouteTableAssociation
+    Properties:
+      ImageId:
+        Ref: AmiId
+      InstanceType:
+        Ref: InstanceType
+      IamInstanceProfile:
+        Ref: RuntimeInstanceProfile
+      SubnetId:
+        Ref: PublicSubnet
+      SecurityGroupIds:
+        - Ref: RuntimeSecurityGroup
+      CreditSpecification:
+        CPUCredits: standard
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      Monitoring: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 12
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-runtime'
+        - Key: Application
+          Value: RouteWise
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -Eeuo pipefail
+          umask 077
+          exec > >(tee -a /var/log/routewise-bootstrap.log) 2>&1
+          trap 'echo "RouteWise host bootstrap failed; inspect this log before deploying." >&2' ERR
+          install -d -m 0750 /opt/routewise
+          # EIP association follows instance creation. Retry package installation
+          # until that public route is usable; no temporary second IPv4 is needed.
+          # The SSM endpoint need not authorize this probe: a TLS response proves
+          # DNS and public HTTPS egress are available. Wait at most ten minutes.
+          network_ready=0
+          for attempt in {1..30}; do
+            if curl --silent --show-error --connect-timeout 5 --max-time 10 \
+                https://ssm.us-east-1.amazonaws.com/ -o /dev/null; then
+              network_ready=1
+              break
+            fi
+            sleep 10
+          done
+          test "$network_ready" -eq 1
+          packages_ready=0
+          for attempt in {1..5}; do
+            if dnf install -y docker awscli-2 amazon-ssm-agent xfsprogs nvme-cli jq util-linux e2fsprogs coreutils systemd; then
+              packages_ready=1
+              break
+            fi
+            sleep 10
+          done
+          test "$packages_ready" -eq 1
+          systemctl enable --now docker amazon-ssm-agent
+          install -d -m 0755 /usr/local/lib/docker/cli-plugins
+          compose_download_dir=$(mktemp -d /var/tmp/routewise-compose.XXXXXX)
+          cd "$compose_download_dir"
+          compose_release=https://github.com/docker/compose/releases/download/v2.39.4
+          curl --fail --silent --show-error --location --retry 12 --retry-all-errors \
+            --connect-timeout 15 --max-time 180 \
+            "$compose_release/docker-compose-linux-x86_64" -o docker-compose-linux-x86_64
+          curl --fail --silent --show-error --location --retry 12 --retry-all-errors \
+            --connect-timeout 15 --max-time 60 \
+            "$compose_release/docker-compose-linux-x86_64.sha256" -o docker-compose-linux-x86_64.sha256
+          sha256sum --check docker-compose-linux-x86_64.sha256
+          install -m 0755 docker-compose-linux-x86_64 /usr/local/lib/docker/cli-plugins/docker-compose
+          docker compose version
+          docker info >/dev/null
+          aws --version
+          systemctl is-active --quiet amazon-ssm-agent
+          # The separate SSM deployment script waits for this marker, identifies
+          # and mounts the attached data volume, and starts the runtime services.
+          touch /opt/routewise/bootstrap-ready
+          echo "RouteWise host bootstrap completed."
+  RuntimeAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-origin'
+  RuntimeAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId:
+        Ref: RuntimeInstance
+      AllocationId:
+        Fn::GetAtt: [RuntimeAddress, AllocationId]
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      Encrypted: true
+      VolumeType: gp3
+      Size: 30
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: '${AWS::StackName}-data'
+        - Key: Application
+          Value: RouteWise
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId:
+        Ref: RuntimeInstance
+      VolumeId:
+        Ref: DataVolume
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name:
+          Fn::Sub: '${AWS::StackName}-web-oac'
+        Description: Signed CloudFront access to the private frontend bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  WebCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name:
+          Fn::Sub: '${AWS::StackName}-web'
+        Comment: Honor frontend object cache-control, including no-cache for index.html.
+        MinTTL: 0
+        DefaultTTL: 300
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name:
+          Fn::Sub: '${AWS::StackName}-api-no-cache'
+        Comment: Never cache API or health responses.
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: false
+          EnableAcceptEncodingGzip: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name:
+          Fn::Sub: '${AWS::StackName}-api-forwarding'
+        Comment: Preserve all query parameters and application/CORS headers; use the origin Host.
+        CookiesConfig:
+          CookieBehavior: none
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - CloudFront-Viewer-Address
+            - Origin
+            - Content-Type
+            - Accept
+            - Access-Control-Request-Method
+            - Access-Control-Request-Headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+  WebResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name:
+          Fn::Sub: '${AWS::StackName}-web-security'
+        Comment: Browser protections for the same-origin RouteWise frontend.
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: >-
+              default-src 'self'; script-src 'self'; style-src 'self';
+              img-src 'self' data:; font-src 'self'; connect-src 'self';
+              object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: false
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Permissions-Policy
+              Value: 'camera=(), microphone=(), geolocation=()'
+              Override: true
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name:
+        Fn::Sub: '${AWS::StackName}-spa-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite extensionless frontend routes to index.html without masking API errors.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          // This function is attached only to the S3 behavior. Keep API/health
+          // routes protected if the behavior list is extended in the future.
+          if (uri === '/api' || uri.indexOf('/api/') === 0 ||
+              uri === '/health' || uri.indexOf('/health/') === 0 || uri === '/healthz') {
+            return request;
+          }
+          if (uri.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: RouteWise static frontend and protected HTTPS runtime origin.
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Aliases:
+          Fn::If:
+            - HasWebCustomDomain
+            - - Ref: WebCustomDomain
+            - Ref: AWS::NoValue
+        ViewerCertificate:
+          Fn::If:
+            - HasWebCustomDomain
+            - AcmCertificateArn:
+                Ref: WebCertificateArn
+              SslSupportMethod: sni-only
+              MinimumProtocolVersion: TLSv1.2_2021
+            - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: private-web
+            DomainName:
+              Fn::GetAtt: [WebBucket, RegionalDomainName]
+            OriginAccessControlId:
+              Ref: WebOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: runtime-api
+            DomainName:
+              Ref: OriginDomain
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              - HeaderName: X-RouteWise-Origin-Token
+                HeaderValue:
+                  Ref: OriginVerifyToken
+        DefaultCacheBehavior:
+          TargetOriginId: private-web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId:
+            Ref: WebCachePolicy
+          ResponseHeadersPolicyId:
+            Ref: WebResponseHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN:
+                Fn::GetAtt: [SpaRewriteFunction, FunctionARN]
+        # No distribution-wide 403/404 -> index.html mapping: API failures must
+        # remain API failures. Only the default S3 behavior receives SPA rewriting.
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: runtime-api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId:
+              Ref: ApiCachePolicy
+            OriginRequestPolicyId:
+              Ref: ApiOriginRequestPolicy
+          - PathPattern: /api
+            TargetOriginId: runtime-api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId:
+              Ref: ApiCachePolicy
+            OriginRequestPolicyId:
+              Ref: ApiOriginRequestPolicy
+          - PathPattern: /health/*
+            TargetOriginId: runtime-api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId:
+              Ref: ApiCachePolicy
+            OriginRequestPolicyId:
+              Ref: ApiOriginRequestPolicy
+          - PathPattern: /health
+            TargetOriginId: runtime-api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId:
+              Ref: ApiCachePolicy
+            OriginRequestPolicyId:
+              Ref: ApiOriginRequestPolicy
+          - PathPattern: /healthz
+            TargetOriginId: runtime-api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId:
+              Ref: ApiCachePolicy
+            OriginRequestPolicyId:
+              Ref: ApiOriginRequestPolicy
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowThisCloudFrontDistribution
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: '${WebBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn:
+                  Fn::Sub: 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt: [WebBucket, Arn]
+              - Fn::Sub: '${WebBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # IAM obtains the provider thumbprint; do not pin an expiring certificate.
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Publish RouteWise artifacts and invoke deployment on the single runtime host.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated:
+                Fn::If:
+                  - CreateGitHubOidcProvider
+                  - Ref: GitHubOidcProvider
+                  - Ref: ExistingGitHubOidcProviderArn
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Exact environment subjects only; no branches, pull requests,
+                # forks, or wildcard owners/repositories. Protect this GitHub
+                # environment and its deployment branch policy in bootstrap.
+                token.actions.githubusercontent.com:sub:
+                  - Fn::Sub: 'repo:${GitHubRepository}:environment:${EnvironmentName}'
+                  - Fn::Sub:
+                      - 'repo:${Owner}@${GitHubOwnerId}/${Repository}@${GitHubRepositoryId}:environment:${EnvironmentName}'
+                      - Owner:
+                          Fn::Select:
+                            - 0
+                            - Fn::Split:
+                                - /
+                                - Ref: GitHubRepository
+                        Repository:
+                          Fn::Select:
+                            - 1
+                            - Fn::Split:
+                                - /
+                                - Ref: GitHubRepository
+      Policies:
+        - PolicyName: PublishAndDeployRouteWise
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadThisStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource:
+                  Ref: AWS::StackId
+              - Sid: ListDeploymentBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - Fn::GetAtt: [WebBucket, Arn]
+                  - Fn::GetAtt: [ReleaseBucket, Arn]
+              - Sid: PublishFrontend
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  Fn::Sub: '${WebBucket.Arn}/*'
+              - Sid: PublishReleaseArtifacts
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  Fn::Sub: '${ReleaseBucket.Arn}/*'
+              - Sid: RefreshThisDistribution
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                  - cloudfront:GetDistribution
+                Resource:
+                  Fn::Sub: 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}'
+              - Sid: RunDeploymentOnThisInstance
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - Fn::Sub: 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript'
+                  - Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${RuntimeInstance}'
+              - Sid: ReadCommandStatus
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                # These Systems Manager status actions do not support resource ARNs.
+                Resource: '*'
+
+Outputs:
+  InstanceId:
+    Description: SSM-managed single runtime instance.
+    Value:
+      Ref: RuntimeInstance
+  DataVolumeId:
+    Description: Persistent encrypted volume; runtime must identify it by volume ID on Nitro.
+    Value:
+      Ref: DataVolume
+  PublicIp:
+    Description: Create a DNS-only A record for OriginDomain pointing here.
+    Value:
+      Ref: RuntimeAddress
+  WebBucketName:
+    Value:
+      Ref: WebBucket
+  ReleaseBucketName:
+    Value:
+      Ref: ReleaseBucket
+  BackupBucketName:
+    Value:
+      Ref: BackupBucket
+  DistributionId:
+    Value:
+      Ref: WebDistribution
+  DistributionDomainName:
+    Value:
+      Fn::GetAtt: [WebDistribution, DomainName]
+  DeploymentRoleArn:
+    Value:
+      Fn::GetAtt: [DeploymentRole, Arn]
+  OriginDomainName:
+    Value:
+      Ref: OriginDomain

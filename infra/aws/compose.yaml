@@ -1,0 +1,167 @@
+name: routewise-prod
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-backend: &backend-runtime
+  image: ${BACKEND_IMAGE:?An immutable backend image digest is required}
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  mem_limit: 512m
+  cpus: 0.75
+  pids_limit: 128
+  environment:
+    ROUTEWISE_ENVIRONMENT: production
+    ROUTEWISE_DATABASE_URL: postgresql+asyncpg://routewise:${POSTGRES_PASSWORD:?Database password is required}@postgres:5432/routewise
+    ROUTEWISE_CORS_ORIGINS: ${ROUTEWISE_CORS_ORIGINS:-[]}
+    ROUTEWISE_AUTO_CREATE_SCHEMA: "false"
+    ROUTEWISE_DATABASE_POOL_SIZE: "5"
+    ROUTEWISE_DATABASE_MAX_OVERFLOW: "2"
+    ROUTEWISE_MAX_ROUTE_RUNS: "5000"
+  networks: [application]
+  logging: *bounded-logging
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 128
+    environment:
+      POSTGRES_DB: routewise
+      POSTGRES_USER: routewise
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password is required}
+    command: [postgres, -c, shared_buffers=128MB, -c, max_connections=40]
+    volumes:
+      - type: bind
+        source: /srv/routewise/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    # Database and application ports are reachable only on this Docker network.
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks: [application]
+    logging: *bounded-logging
+
+  backend:
+    <<: *backend-runtime
+    restart: unless-stopped
+    # Migrations run once, separately, before replacing the application.
+    command: [uvicorn, routewise.main:app, --host, 0.0.0.0, --port, "8000", --proxy-headers, --forwarded-allow-ips, "*"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  migrate:
+    <<: *backend-runtime
+    profiles: [maintenance]
+    restart: "no"
+    command: [alembic, upgrade, head]
+
+  api-proxy:
+    # Keep the same audited Nginx image used by frontend/Dockerfile.
+    image: nginxinc/nginx-unprivileged:1.29-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+    restart: unless-stopped
+    read_only: true
+    entrypoint: [nginx]
+    command: [-g, "daemon off;"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    volumes:
+      - type: bind
+        source: ./api-proxy.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [application, origin-proxy]
+    logging: *bounded-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 128
+    environment:
+      ORIGIN_DOMAIN: ${ORIGIN_DOMAIN:?Origin domain is required}
+      ORIGIN_VERIFY_TOKEN: ${ORIGIN_VERIFY_TOKEN:?Origin token is required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/routewise/caddy/data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/routewise/caddy/config
+        target: /config
+        bind:
+          create_host_path: false
+    depends_on:
+      api-proxy:
+        condition: service_healthy
+    # This process check needs neither public DNS nor a newly issued certificate.
+    # Do not publish the loopback-only Caddy admin port.
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:2019/config/]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [origin-proxy, internet]
+    logging: *bounded-logging
+
+networks:
+  application:
+    internal: true
+  origin-proxy:
+    internal: true
+  internet: {}
