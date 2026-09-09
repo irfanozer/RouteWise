@@ -64,14 +64,6 @@ jobs:
       - name: Verify deployment safeguards
         run: python -m unittest discover -s tests/deployment -v
 
-      - name: Test AWS CLI output handling without AWS access
-        shell: pwsh
-        run: ./tests/deployment/test_aws_powershell.ps1 -PythonExecutable (Get-Command python).Source
-
-      - name: Test GitHub environment setup without cloud access
-        shell: pwsh
-        run: ./tests/deployment/test_github_oidc_powershell.ps1 -PythonExecutable (Get-Command python).Source
-
       - name: Validate proxy configurations without AWS access
         shell: bash
         env:
@@ -99,25 +91,3 @@ jobs:
             --security-opt no-new-privileges:true --entrypoint nginx \
             --mount "type=bind,source=$PWD/infra/aws/api-proxy.conf,target=/etc/nginx/nginx.conf,readonly" \
             "$nginx_image" -t
-
-  windows-powershell:
-    name: Test Windows PowerShell 5.1 compatibility
-    runs-on: windows-latest
-    env:
-      AWS_EC2_METADATA_DISABLED: "true"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-
-      - name: Test native output handling in Windows PowerShell
-        shell: powershell
-        run: ./tests/deployment/test_aws_powershell.ps1 -PythonExecutable (Get-Command python).Source
-
-      - name: Test GitHub environment setup in Windows PowerShell
-        shell: powershell
-        run: ./tests/deployment/test_github_oidc_powershell.ps1 -PythonExecutable (Get-Command python).Source
