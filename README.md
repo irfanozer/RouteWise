@@ -1,66 +1,157 @@
 # RouteWise
 
-RouteWise is a disruption-aware transit-routing demonstration. It answers one
-practical question: **when part of a transit network stops working, what is the
-best replacement journey and why did it change?**
+**A transit route planner that explains what changes when a journey is disrupted.**
 
-The public demo follows one understandable incident through a real application:
+[Live demo](https://routewise.irfanburakozer.com/) |
+[Portfolio case study](https://irfanburakozer.com/projects/route-wise) |
+[AWS deployment guide](docs/AWS_DEPLOYMENT.md)
 
-1. A rider has a normal route across the fictional Metrovale network.
-2. A station closure or service delay makes that route unavailable or slower.
-3. RouteWise compares the network again using the rider's priority: fastest,
-   fewest transfers, or a route that requires no stairs.
-4. It returns a replacement route and a plain-language explanation of the
-   changed stations, time, transfers, and accessibility constraints.
-5. The calculation is stored so the exact decision can be opened and replayed.
+RouteWise compares a normal journey with a replacement when a station closes,
+a train line slows down, or an elevator stops working. It shows both routes on
+a map, explains the difference, and saves the calculation so it can be inspected
+and replayed.
 
-There is no real transit agency, live passenger information, or trip purchase.
-Metrovale is a deterministic test network. The HTTP requests, graph search,
-PostgreSQL writes, cache behavior, and replayed results are real application
-behavior.
+The public demo is live on **AWS**. Azure deployment files remain in the
+repository as an alternative.
 
-## What this project demonstrates
+## Try the demo
 
-- deterministic shortest-path routing with stable tie-breaking;
-- fastest, fewest-transfer, and no-stairs route objectives;
-- station closures, line delays, and elevator outages applied as versioned network changes;
-- an explanation that compares the normal and disrupted journeys;
-- persisted calculation receipts and reproducible replay;
-- cache keys tied to network versions so stale routes are not reused;
-- a typed React interface backed by FastAPI and PostgreSQL;
-- containerized local operation and deployment-ready infrastructure.
+1. Open the [live site](https://routewise.irfanburakozer.com/) and look at the
+   Metrovale map.
+2. Choose a service problem. Each prepared case suggests a trip that shows its
+   effect.
+3. Choose **Fastest**, **Fewest transfers**, or **No stairs**.
+4. Press **Compare normal route with replacement**.
+5. Compare the highlighted paths, travel times, and explanation.
+6. Open the saved decision record or replay the calculation.
 
-## Run it locally
+A **disruption** is simply a service problem. The eight cases cover station
+closures at Central, Riverfront, and Harbor Point; delays on the Red, Blue,
+and Green lines; and elevator outages at Central and Metrovale University.
 
-The simplest route uses Docker Desktop. From this directory:
+| Priority | What RouteWise chooses |
+| --- | --- |
+| Fastest | The shortest travel time, using fewer transfers to break a tie. |
+| Fewest transfers | The fewest line changes, using travel time to break a tie. |
+| No stairs | The fastest route using only stations and connections marked accessible, excluding relevant elevator outages. |
+
+Metrovale is a fictional network, not a live transit feed. No tickets, real
+passenger accounts, payments, or location tracking are involved. The API
+requests, routing calculations, database writes, and replay results are real.
+
+## How the calculation works
+
+The browser sends `POST /api/v1/routes/compare`. FastAPI validates the trip
+and asks the routing engine to calculate two journeys with the same priority:
+one on the normal network and one with the selected disruption.
+
+- **Routing:** Dijkstra's algorithm tracks both the station and current line,
+  so changing lines has an explicit cost. Stable tie-breaking makes equal-cost
+  choices repeatable.
+- **Travel time:** Each segment contributes its travel minutes, any delay on
+  that segment, and four extra minutes if the rider changes lines. Initial
+  boarding does not count as a transfer.
+- **Saved evidence:** PostgreSQL stores the inputs, network and disruption
+  snapshots, both routes, and the explanation in a calculation receipt.
+- **Replay:** The API recalculates from the saved snapshots and creates a new
+  receipt linked to the original. It uses the current routing engine; receipt
+  IDs, processing times, and cache metadata can differ.
+- **Caching:** A bounded, in-process cache includes the trip inputs and network
+  versions in its keys, so an old disruption cannot answer a newer request.
+
+The map's segment labels make the time calculation inspectable. RouteWise can
+also report that no valid replacement exists under the selected constraints.
+
+## Stack and deployment
+
+| Part | Technology |
+| --- | --- |
+| Interface | React, TypeScript, Vite |
+| API and routing | Python 3.12, FastAPI, deterministic graph search |
+| Persistence | PostgreSQL, SQLAlchemy, Alembic |
+| Packaging and checks | Docker Compose, pytest, Vitest, Ruff, mypy, ESLint |
+| Current hosting | AWS CloudFront, private S3, EC2, EBS, ACM, Systems Manager |
+| Infrastructure and releases | CloudFormation, GitHub Actions, GitHub OIDC, GHCR |
+| Alternative hosting | Azure Container Apps and Bicep |
+
+### Current AWS request path
+
+```text
+Browser -> CloudFront HTTPS
+             |-- page and assets -> private S3 bucket
+             |
+             +-- /api/* -> Caddy HTTPS -> Nginx -> FastAPI
+                                                   |-- routing engine
+                                                   +-- PostgreSQL
+
+Caddy, Nginx, FastAPI, and PostgreSQL run in Docker on one EC2 host.
+Database files use EBS; scheduled logical backups go to private S3.
+```
+
+**CloudFormation** defines the infrastructure. **CloudFront** serves the
+frontend and forwards API requests to the server. Cloudflare provides DNS.
+
+The EC2 application stays running instead of scaling to zero. It is a
+single-host deployment, not a multi-zone system: host failures and maintenance
+can cause downtime. PostgreSQL runs in a container, not RDS; Kubernetes is not
+part of this deployment.
+
+### CI/CD and deployment options
+
+A push to `main` runs application CI and AWS deployment-asset checks. The image
+workflow publishes matching immutable backend and frontend images to GHCR.
+
+When `AWS_DEPLOYMENT_ENABLED=true`, the AWS workflow checks that the exact
+commit passed application CI and AWS deployment-asset checks, obtains temporary
+AWS credentials through GitHub OIDC, and deploys through Systems Manager.
+It also uploads the matching frontend to S3,
+refreshes CloudFront, and checks the public application.
+
+- [AWS setup, certificates, releases, backups, and costs](docs/AWS_DEPLOYMENT.md)
+- [Azure setup and custom domains](docs/DEPLOYMENT.md)
+- [Component boundaries and routing design](docs/ARCHITECTURE.md)
+
+The Azure workflow remains independently controlled by
+`AZURE_DEPLOYMENT_ENABLED`. Keeping those files does not require running Azure
+resources alongside AWS. A README-only push can still trigger the existing
+workflows; they do not exclude documentation changes.
+
+## Run locally with Docker
+
+Install Docker Desktop with Docker Compose. From the repository root:
 
 ```powershell
 docker compose up --build --wait
 ```
 
-Open [http://localhost:3003](http://localhost:3003). The API is also available
-directly at [http://localhost:8004/docs](http://localhost:8004/docs), although
-the browser demo sends same-origin requests through the frontend.
+- Website: [http://localhost:3003](http://localhost:3003)
+- API documentation: [http://localhost:8004/docs](http://localhost:8004/docs)
+- Local PostgreSQL host port: `5436`
 
-To verify the running stack:
+The frontend forwards browser requests to the API. The database is initialized
+through the container startup and migration path.
+
+Check the running stack, including a stored and replayed sample calculation:
 
 ```powershell
-./scripts/check-local.ps1
+.\scripts\check-local.ps1
 ```
 
-To stop it without deleting the local database:
+Stop the containers while keeping the database:
 
 ```powershell
 docker compose down
 ```
 
-Use `docker compose down --volumes` only when you deliberately want to erase
-the RouteWise local database and start fresh.
+Adding `--volumes` also deletes the local database. Use it only when you want
+to discard that data.
 
-### Run without Docker Desktop
+### Development without Docker
 
-For a quick development preview, start the API with a local SQLite file. In one
-PowerShell window:
+Use Python 3.12 and Node.js 24. SQLite provides a quick preview, while the
+Docker and cloud deployments use PostgreSQL.
+
+In one PowerShell window, from the repository root:
 
 ```powershell
 cd backend
@@ -69,89 +160,41 @@ py -3.12 -m venv .venv
 python -m pip install --editable ".[dev]"
 $env:ROUTEWISE_DATABASE_URL = "sqlite+aiosqlite:///./routewise-local.db"
 $env:ROUTEWISE_AUTO_CREATE_SCHEMA = "true"
-uvicorn routewise.main:app --reload --port 8004
+uvicorn routewise.main:app --reload --host 127.0.0.1 --port 8004
 ```
 
-In a second PowerShell window:
+In a second window, also starting at the repository root:
 
 ```powershell
 cd frontend
-npm install
-$env:VITE_API_BASE_URL = "http://localhost:8004"
-npm run dev -- --port 3003
+npm ci
+$env:VITE_API_BASE_URL = ""
+$env:VITE_DEV_BACKEND_URL = "http://127.0.0.1:8004"
+npm run dev -- --host 127.0.0.1 --port 3003 --strictPort
 ```
 
-Then open [http://localhost:3003](http://localhost:3003). SQLite is only the
-fast preview path; Docker Compose and production use PostgreSQL.
+Open [http://127.0.0.1:3003](http://127.0.0.1:3003). The development server
+proxies API requests, so the page and API share the same browser origin.
 
-## Demo walkthrough
+## Quality checks
 
-The page is deliberately one demo rather than separate technical dashboards:
-
-1. Start with the large map, which labels all stations and lines in Metrovale.
-2. Choose one of eight prepared service problems. Each case loads a trip where
-   its effect is visible.
-3. Check the start, destination, and route priority.
-4. Press **Compare normal route with replacement**.
-5. Compare the normal and replacement routes, then read the sentence explaining
-   the decision.
-6. Open the decision record or replay it to confirm that the saved network
-   snapshot produces the same result.
-
-## Architecture
-
-```text
-Browser
-  |  same-origin /api request
-  v
-Nginx + React  --->  FastAPI  --->  routing engine
-                         |               |
-                         +---- PostgreSQL+
-```
-
-The routing engine is a pure deterministic module. The API validates requests,
-loads the seeded network, applies the selected disruption, asks the engine for
-both routes, stores the complete calculation receipt, and returns one response.
-The frontend displays only data returned by the API.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component boundaries and
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the Azure deployment and custom
-domain handoff.
-
-An independent [AWS deployment guide](docs/AWS_DEPLOYMENT.md) is also included.
-It uses CloudFormation, private S3, CloudFront, and a continuously running EC2
-host with Docker, PostgreSQL, and GitHub OIDC releases. The Azure infrastructure
-and workflow remain available and are not replaced by the AWS setup.
-
-## Development checks
+After installing the backend development dependencies and frontend packages,
+run this from the repository root. Docker is also needed to validate Compose:
 
 ```powershell
-./scripts/check.ps1
+.\scripts\check.ps1
 ```
 
-The repository CI runs backend formatting, linting, type checks, migrations,
-and tests; frontend lint, tests, and production build; and a complete Compose
-smoke test.
+CI additionally checks PostgreSQL migrations, the complete container stack,
+AWS infrastructure and deployment scripts, and runtime proxy behavior.
 
-## Current stage
+## Scope and data handling
 
-The application is complete through local production-like verification.
-Deployment configuration is included, but cloud resources, DNS, certificates,
-repository variables, and production secrets are intentionally not created by
-this repository.
-
-The production workflow is also inert until the repository variable
-`AZURE_DEPLOYMENT_ENABLED` is explicitly set to `true`. Successful CI on `main`
-can publish the immutable backend and frontend images while deployment remains
-disabled. Both GHCR packages must be made public once so Azure can pull them
-anonymously without a stored GitHub credential.
-
-## Safety and scope
-
-- All station, route, schedule, and disruption data is fictional.
-- The demo does not collect accounts, payment details, or precise user location.
-- The public API uses a bounded seeded network rather than arbitrary graph input.
-- Route calculation history is capped at 5,000 receipts; after the cap is
-  reached, the oldest receipts are removed as new ones are stored.
-- Production database credentials belong in Azure/GitHub secret storage, never
-  in committed files.
+- All stations, travel times, and service problems are fictional.
+- Requests use a bounded, seeded network rather than arbitrary graph input.
+- Calculation history defaults to 5,000 receipts. Older records are removed as
+  new ones are stored, so it is not permanent journey history.
+- AWS runtime secrets use Systems Manager Parameter Store SecureString values.
+  Credentials and local environment files do not belong in source control.
+- This project demonstrates explainable routing and reproducible calculations,
+  not real-world transit availability or accessibility guarantees.
