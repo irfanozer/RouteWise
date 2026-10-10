@@ -53,6 +53,23 @@ def fixture():
     resources = [
         {"LogicalResourceId": "RuntimeInstance", "PhysicalResourceId": "i-existing"},
         {"LogicalResourceId": "DataVolume", "PhysicalResourceId": "vol-existing"},
+        {
+            "LogicalResourceId": "DataVolumeAttachment",
+            "PhysicalResourceId": "vol-existing|i-existing",
+        },
+        {
+            "LogicalResourceId": "RuntimeAddressAssociation",
+            "PhysicalResourceId": "eipassoc-existing",
+        },
+        {"LogicalResourceId": "DeploymentRole", "PhysicalResourceId": "role-existing"},
+        {
+            "LogicalResourceId": "RuntimeRole",
+            "PhysicalResourceId": "runtime-role-existing",
+        },
+        {
+            "LogicalResourceId": "RuntimeSecurityGroup",
+            "PhysicalResourceId": "sg-existing",
+        },
     ]
     instance = {
         "InstanceId": "i-existing",
@@ -90,24 +107,70 @@ def fixture():
                     "PhysicalResourceId": "i-existing",
                     "ResourceType": "AWS::EC2::Instance",
                     "Action": "Modify",
-                    "Replacement": "False",
+                    "Replacement": "Conditional",
                     "Scope": ["Properties"],
                     "Details": [
                         {
                             "Target": {
                                 "Attribute": "Properties",
                                 "Name": "InstanceType",
-                                "RequiresRecreation": "Never",
+                                "RequiresRecreation": "Conditionally",
+                            },
+                            "ChangeSource": "DirectModification",
+                            "Evaluation": "Dynamic",
+                        },
+                        {
+                            "Target": {
+                                "Attribute": "Properties",
+                                "Name": "InstanceType",
+                                "RequiresRecreation": "Conditionally",
                             },
                             "ChangeSource": "ParameterReference",
                             "CausingEntity": "InstanceType",
                             "Evaluation": "Static",
-                        }
+                        },
                     ],
                 },
             }
         ],
     }
+    physical = RESIZE.pairs(resources, "LogicalResourceId", "PhysicalResourceId")
+    for logical_id in (
+        "DataVolumeAttachment",
+        "RuntimeAddressAssociation",
+        "DeploymentRole",
+    ):
+        kind, replacement = RESIZE.RESIZE_DEPENDENCIES[logical_id]
+        name, recreation = (
+            ("Policies", "Never")
+            if logical_id == "DeploymentRole"
+            else ("InstanceId", "Always")
+        )
+        change_set["Changes"].append(
+            {
+                "Type": "Resource",
+                "ResourceChange": {
+                    "LogicalResourceId": logical_id,
+                    "PhysicalResourceId": physical[logical_id],
+                    "ResourceType": kind,
+                    "Action": "Modify",
+                    "Replacement": replacement,
+                    "Scope": ["Properties"],
+                    "Details": [
+                        {
+                            "Target": {
+                                "Attribute": "Properties",
+                                "Name": name,
+                                "RequiresRecreation": recreation,
+                            },
+                            "ChangeSource": "ResourceReference",
+                            "CausingEntity": "RuntimeInstance",
+                            "Evaluation": "Dynamic",
+                        }
+                    ],
+                },
+            }
+        )
     template = RESIZE.parse_template(
         (ROOT / "infra/aws/foundation.yaml").read_text(encoding="utf-8")
     )
@@ -154,7 +217,9 @@ class FakeAws:
             return {"Id": "arn:fixture:change-set"}
         if operation == "describe-change-set":
             return copy.deepcopy(self.change_set)
-        if operation == "execute-change-set":
+        if operation == "update-stack":
+            if "StackPolicyDuringUpdateBody" not in request:
+                raise AssertionError("An unprotected update is forbidden")
             for item in self.stack["Parameters"]:
                 if item["ParameterKey"] == "InstanceType":
                     item["ParameterValue"] = self.desired
@@ -183,7 +248,9 @@ class ResizeTests(unittest.TestCase):
 
     def validate_change(self):
         RESIZE.validate_change_set(
-            self.aws.change_set, "i-existing", self.aws.stack["StackId"]
+            self.aws.change_set,
+            RESIZE.pairs(self.aws.resources, "LogicalResourceId", "PhysicalResourceId"),
+            self.aws.stack["StackId"],
         )
 
     def test_live_template_changes_only_instance_allowed_values(self):
@@ -331,14 +398,14 @@ class ResizeTests(unittest.TestCase):
     def test_replacements_removal_dynamic_or_other_properties_rejected(self):
         mutations = [
             lambda c: c.update(Replacement="True"),
-            lambda c: c.update(Replacement="Conditional"),
+            lambda c: c.update(Replacement="False"),
             lambda c: c.update(Action="Remove"),
             lambda c: c.update(PhysicalResourceId="i-other"),
             lambda c: c.update(Scope=["Properties", "Metadata"]),
             lambda c: c.update(Details=[]),
             lambda c: c["Details"][0]["Target"].update(Name="ImageId"),
             lambda c: c["Details"][0]["Target"].update(RequiresRecreation="Always"),
-            lambda c: c["Details"][0].update(Evaluation="Dynamic"),
+            lambda c: c["Details"][0].update(Evaluation="Static"),
             lambda c: c["Details"][0].update(CausingEntity="AmiId"),
         ]
         for index, mutate in enumerate(mutations):
@@ -354,6 +421,9 @@ class ResizeTests(unittest.TestCase):
         self.assertFalse(self.aws.changed)
         self.assertNotIn(
             "execute-change-set", [operation for _, operation, _ in self.aws.calls]
+        )
+        self.assertNotIn(
+            "update-stack", [operation for _, operation, _ in self.aws.calls]
         )
         self.assertFalse(
             any(operation.startswith("delete-") for _, operation, _ in self.aws.calls)
@@ -384,6 +454,19 @@ class ResizeTests(unittest.TestCase):
             )
             self.assertEqual(create["ChangeSetType"], "UPDATE")
             self.assertEqual(create["Capabilities"], ["CAPABILITY_NAMED_IAM"])
+            update = next(
+                request
+                for _, operation, request in aws.calls
+                if operation == "update-stack"
+            )
+            for key in ("StackName", "TemplateBody", "Parameters", "Capabilities"):
+                self.assertEqual(update[key], create[key])
+            self.assertNotIn(
+                "execute-change-set", [operation for _, operation, _ in aws.calls]
+            )
+            self.assertNotIn("StackPolicyBody", update)
+            self.assertNotIn("RoleARN", update)
+            self.assertIn("StackPolicyDuringUpdateBody", update)
 
     def test_failed_change_set_and_stack_do_not_continue(self):
         self.aws.change_set["Status"] = "FAILED"
@@ -422,6 +505,109 @@ class ResizeTests(unittest.TestCase):
             )
         self.assertEqual(read.call_count, 2)
         sleep.assert_called_once()
+
+    def test_policy_explicitly_protects_every_resource_against_replacement_and_deletion(
+        self,
+    ):
+        physical = RESIZE.pairs(
+            self.aws.resources, "LogicalResourceId", "PhysicalResourceId"
+        )
+        statements = RESIZE.protective_policy(physical)["Statement"]
+        self.assertEqual(
+            statements[0],
+            {
+                "Effect": "Deny",
+                "Action": ["Update:Replace", "Update:Delete"],
+                "Principal": "*",
+                "Resource": "*",
+            },
+        )
+        self.assertEqual(statements[1]["Action"], "Update:Modify")
+        self.assertEqual(
+            set(statements[1]["Resource"]),
+            {f"LogicalResourceId/{key}" for key in RESIZE.RESIZE_DEPENDENCIES},
+        )
+        self.assertEqual(statements[2]["Effect"], "Deny")
+        self.assertEqual(statements[2]["Action"], "Update:*")
+        self.assertEqual(
+            set(statements[2]["Resource"]),
+            {
+                f"LogicalResourceId/{key}"
+                for key in physical
+                if key not in RESIZE.RESIZE_DEPENDENCIES
+            },
+        )
+        self.assertIn("LogicalResourceId/DataVolume", statements[2]["Resource"])
+        self.assertNotIn("NotResource", json.dumps(statements))
+
+    def test_dependency_details_must_reference_only_runtime_instance(self):
+        mutations = [
+            lambda c: c["Details"][0].update(CausingEntity="RuntimeRole"),
+            lambda c: c["Details"][0].update(ChangeSource="DirectModification"),
+            lambda c: c["Details"][0].update(Evaluation="Static"),
+            lambda c: c["Details"][0]["Target"].update(Name="ManagedPolicyArns"),
+            lambda c: c["Details"].append(copy.deepcopy(c["Details"][0])),
+            lambda c: c.update(PhysicalResourceId="another-resource"),
+            lambda c: c.update(Replacement="True"),
+        ]
+        for index in range(1, 4):
+            for mutation, change in enumerate(mutations):
+                self.aws = FakeAws()
+                change(self.aws.change_set["Changes"][index]["ResourceChange"])
+                with (
+                    self.subTest(resource=index, mutation=mutation),
+                    self.assertRaises(RESIZE.Refusal),
+                ):
+                    self.validate_change()
+
+    def test_live_template_or_resource_race_refuses_protected_update(self):
+        for kind in ("template", "physical"):
+            aws = FakeAws()
+            original_call = aws.call
+
+            def racing_call(
+                service,
+                operation,
+                *,
+                original_call=original_call,
+                kind=kind,
+                aws=aws,
+                **request,
+            ):
+                result = original_call(service, operation, **request)
+                if operation == "describe-change-set":
+                    if kind == "template":
+                        aws.template["Resources"]["DeploymentRole"]["Properties"][
+                            "Description"
+                        ] = "changed concurrently"
+                    else:
+                        aws.resources[-1]["PhysicalResourceId"] = "sg-changed"
+                return result
+
+            with (
+                patch.object(aws, "call", side_effect=racing_call),
+                self.assertRaises(RESIZE.Refusal),
+            ):
+                RESIZE.run(self.apply_args(), aws)
+            self.assertFalse(aws.changed)
+            self.assertNotIn(
+                "update-stack", [operation for _, operation, _ in aws.calls]
+            )
+
+    def test_post_update_checks_all_physical_resource_ids_not_only_outputs(self):
+        original_call = self.aws.call
+
+        def changed_resource(service, operation, **request):
+            result = original_call(service, operation, **request)
+            if operation == "update-stack":
+                self.aws.resources[-1]["PhysicalResourceId"] = "sg-unexpected"
+            return result
+
+        with (
+            patch.object(self.aws, "call", side_effect=changed_resource),
+            self.assertRaises(RESIZE.Refusal),
+        ):
+            RESIZE.run(self.apply_args(), self.aws)
 
 
 if __name__ == "__main__":

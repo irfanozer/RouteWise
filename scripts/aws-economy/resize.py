@@ -246,7 +246,32 @@ def change_parameters(stack, desired):
     ]
 
 
-def validate_change_set(change_set, instance_id, stack_id):
+RESIZE_DEPENDENCIES = {
+    "RuntimeInstance": ("AWS::EC2::Instance", "Conditional"),
+    "DataVolumeAttachment": ("AWS::EC2::VolumeAttachment", "Conditional"),
+    "RuntimeAddressAssociation": ("AWS::EC2::EIPAssociation", "Conditional"),
+    "DeploymentRole": ("AWS::IAM::Role", "False"),
+}
+
+
+def detail_signature(detail):
+    target = detail.get("Target", {})
+    require(
+        set(detail).issubset({"Target", "Evaluation", "ChangeSource", "CausingEntity"})
+        and set(target) == {"Attribute", "Name", "RequiresRecreation"}
+        and target.get("Attribute") == "Properties",
+        "Unexpected property-change detail structure.",
+    )
+    return (
+        target.get("Name"),
+        target.get("RequiresRecreation"),
+        detail.get("Evaluation"),
+        detail.get("ChangeSource"),
+        detail.get("CausingEntity"),
+    )
+
+
+def validate_change_set(change_set, physical_ids, stack_id):
     require(
         change_set.get("StackId") == stack_id, "Change set belongs to another stack."
     )
@@ -257,34 +282,118 @@ def validate_change_set(change_set, instance_id, stack_id):
     )
     changes = change_set.get("Changes", [])
     require(
-        len(changes) == 1,
-        "Refusing any change set affecting more than the runtime instance.",
+        len(changes) == len(RESIZE_DEPENDENCIES),
+        "Only the runtime and its three exact reference-dependent changes are permitted.",
     )
-    item = changes[0]
-    change = item.get("ResourceChange", {})
-    require(
-        item.get("Type") == "Resource"
-        and change.get("LogicalResourceId") == "RuntimeInstance"
-        and change.get("PhysicalResourceId") == instance_id
-        and change.get("ResourceType") == "AWS::EC2::Instance"
-        and change.get("Action") == "Modify"
-        and change.get("Replacement") == "False"
-        and change.get("Scope") == ["Properties"],
-        "Only an in-place instance property modification is permitted.",
-    )
-    details = change.get("Details", [])
-    require(bool(details), "Change set must describe its exact modified property.")
-    for detail in details:
-        target = detail.get("Target", {})
+    seen = set()
+    for item in changes:
+        change = item.get("ResourceChange", {})
+        logical_id = change.get("LogicalResourceId")
         require(
-            target.get("Attribute") == "Properties"
-            and target.get("Name") == "InstanceType"
-            and target.get("RequiresRecreation") == "Never"
-            and detail.get("ChangeSource") == "ParameterReference"
-            and detail.get("CausingEntity") == "InstanceType"
-            and detail.get("Evaluation") == "Static",
-            "Change set includes something other than a static InstanceType parameter change.",
+            logical_id in RESIZE_DEPENDENCIES and logical_id not in seen,
+            "Unexpected or duplicate resource change.",
         )
+        seen.add(logical_id)
+        resource_type, replacement = RESIZE_DEPENDENCIES[logical_id]
+        require(
+            item.get("Type") == "Resource"
+            and change.get("PhysicalResourceId") == physical_ids.get(logical_id)
+            and bool(physical_ids.get(logical_id))
+            and change.get("ResourceType") == resource_type
+            and change.get("Action") == "Modify"
+            and change.get("Replacement") == replacement
+            and change.get("Scope") == ["Properties"],
+            "Resource change differs from the reviewed instance-resize dependency pattern.",
+        )
+        details = [detail_signature(detail) for detail in change.get("Details", [])]
+        if logical_id == "RuntimeInstance":
+            expected = {
+                (
+                    "InstanceType",
+                    "Conditionally",
+                    "Dynamic",
+                    "DirectModification",
+                    None,
+                ),
+                (
+                    "InstanceType",
+                    "Conditionally",
+                    "Static",
+                    "ParameterReference",
+                    "InstanceType",
+                ),
+            }
+        else:
+            name, recreation = (
+                ("Policies", "Never")
+                if logical_id == "DeploymentRole"
+                else ("InstanceId", "Always")
+            )
+            expected = {
+                (name, recreation, "Dynamic", "ResourceReference", "RuntimeInstance")
+            }
+        require(
+            len(details) == len(expected) and set(details) == expected,
+            "Unexpected modification beyond InstanceType and unchanged RuntimeInstance references.",
+        )
+
+
+def protective_policy(physical_ids):
+    """Temporary update-only policy; not an IAM permission or a permanent policy.
+
+    InstanceType change sets conservatively say Conditional. AWS resolves that
+    during update. Deny replacement/deletion even if that resolution surprises us.
+    Every unrelated existing resource is explicitly protected against all updates.
+    https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/protect-stack-resources.html
+    """
+    require(
+        set(RESIZE_DEPENDENCIES).issubset(physical_ids),
+        "Missing expected stack resources.",
+    )
+    statements = [
+        {
+            "Effect": "Deny",
+            "Action": ["Update:Replace", "Update:Delete"],
+            "Principal": "*",
+            "Resource": "*",
+        },
+        {
+            "Effect": "Allow",
+            "Action": "Update:Modify",
+            "Principal": "*",
+            "Resource": [
+                f"LogicalResourceId/{key}" for key in sorted(RESIZE_DEPENDENCIES)
+            ],
+        },
+    ]
+    protected = sorted(set(physical_ids) - set(RESIZE_DEPENDENCIES))
+    if protected:
+        statements.append(
+            {
+                "Effect": "Deny",
+                "Action": "Update:*",
+                "Principal": "*",
+                "Resource": [f"LogicalResourceId/{key}" for key in protected],
+            }
+        )
+    policy = {"Statement": statements}
+    require(
+        len(json.dumps(policy).encode("utf-8")) <= 16384,
+        "Protective policy exceeds the AWS limit.",
+    )
+    return policy
+
+
+def resource_ids(aws, stack_id):
+    items = []
+    request = {"StackName": stack_id}
+    while True:
+        page = aws.call("cloudformation", "list-stack-resources", **request)
+        items.extend(page.get("StackResourceSummaries", []))
+        if not page.get("NextToken"):
+            break
+        request["NextToken"] = page["NextToken"]
+    return pairs(items, "LogicalResourceId", "PhysicalResourceId")
 
 
 class Aws:
@@ -482,7 +591,7 @@ def parser():
     result.add_argument(
         "--apply",
         action="store_true",
-        help="Create, verify, and execute an UPDATE change set.",
+        help="Review an UPDATE change set, then apply the same request with a temporary no-replacement policy.",
     )
     result.add_argument(
         "--confirm-interruption",
@@ -545,38 +654,70 @@ def run(args, aws=None):
         set(capabilities).issubset({"CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"}),
         "Unexpected stack capabilities; macros are not supported.",
     )
+    physical_before = resource_ids(aws, stack["StackId"])
+    policy = protective_policy(physical_before)
+    original_template = parse_template(
+        aws.call(
+            "cloudformation",
+            "get-template",
+            StackName=stack["StackId"],
+            TemplateStage="Original",
+        )["TemplateBody"]
+    )
+    require(
+        economy_template(original_template) == template,
+        "Live template changed before change-set review.",
+    )
+    update_request = {
+        "StackName": stack["StackId"],
+        "TemplateBody": json.dumps(template),
+        "Parameters": change_parameters(stack, args.instance_type),
+        "Capabilities": capabilities,
+    }
     response = aws.call(
         "cloudformation",
         "create-change-set",
-        StackName=stack["StackId"],
         ChangeSetName=f"economy-{uuid.uuid4().hex}",
         ChangeSetType="UPDATE",
         Description="Guarded in-place host resize; existing data and all other resources unchanged.",
-        TemplateBody=json.dumps(template),
-        Parameters=change_parameters(stack, args.instance_type),
-        Capabilities=capabilities,
+        **update_request,
     )
     arn = response["Id"]
     print(f"Created unexecuted change set: {arn}", flush=True)
     change_set = wait_change_set(aws, arn, time.monotonic() + 300)
-    validate_change_set(change_set, outputs["InstanceId"], stack["StackId"])
-    # Recheck immediately before execution to avoid racing a deployment.
-    current = get_stack(aws)
-    validate_stack(current, ACCOUNT)
+    validate_change_set(change_set, physical_before, stack["StackId"])
+    # ExecuteChangeSet cannot carry StackPolicyDuringUpdateBody. Review the
+    # change set, then submit the identical template/parameters to UpdateStack
+    # with temporary protections. Do not execute the unprotected change set.
+    current, _parameters, current_outputs, current_template = inspect(aws)
+    current_original = parse_template(
+        aws.call(
+            "cloudformation",
+            "get-template",
+            StackName=stack["StackId"],
+            TemplateStage="Original",
+        )["TemplateBody"]
+    )
     require(
         current.get("LastUpdatedTime") == stack.get("LastUpdatedTime")
-        and current.get("Parameters") == stack.get("Parameters"),
+        and current.get("Parameters") == stack.get("Parameters")
+        and current_outputs == outputs
+        and current_template == template
+        and current_original == original_template
+        and resource_ids(aws, stack["StackId"]) == physical_before,
         "The stack changed during inspection. The unexecuted change set was left for review.",
     )
     print(
-        "Verified: only RuntimeInstance.InstanceType changes, with no replacement.",
+        "Reviewed: InstanceType and its three reference-only dependencies. "
+        "Applying the same request with replacement/deletion denied for every resource.",
         flush=True,
     )
     aws.call(
         "cloudformation",
-        "execute-change-set",
-        ChangeSetName=arn,
-        StackName=stack["StackId"],
+        "update-stack",
+        StackPolicyDuringUpdateBody=json.dumps(policy),
+        ClientRequestToken=f"economy-{uuid.uuid4().hex}",
+        **update_request,
     )
     wait_stack(
         aws,
@@ -585,6 +726,10 @@ def run(args, aws=None):
         stack.get("LastUpdatedTime"),
     )
     _updated, updated_parameters, updated_outputs, _ = inspect(aws)
+    require(
+        resource_ids(aws, stack["StackId"]) == physical_before,
+        "A physical resource identity changed. Stop and investigate; no recovery was attempted.",
+    )
     require(
         updated_parameters["InstanceType"] == args.instance_type,
         "The completed stack does not have the requested type.",

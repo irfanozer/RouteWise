@@ -93,9 +93,18 @@ are operator attestations, not automatic substitutes for testing.
 
 The resizer reads the live CloudFormation template instead of overwriting it
 with an old local template. It adds the allowed micro size and preserves every
-other parameter. Before execution, it rejects changes to any other resource or
-any replacement. The same EC2 instance, encrypted disks, address, roles and
-database remain in place. It checks the public readiness URLs afterward.
+other parameter. It reviews an unexecuted change set and accepts only the
+instance-size change plus its three exact reference-dependent entries: the data
+disk attachment, address association and deployment role. CloudFormation marks
+some of these as conditional because it cannot settle the instance references
+until the update runs. No role permissions or resource definitions are expanded.
+
+The script rechecks the live stack, then submits the same reviewed template and
+parameters with a temporary stack policy that denies every resource replacement
+or deletion and all modifications outside those four entries. It does not execute
+the unprotected change set. Afterward it requires every physical resource ID to
+remain unchanged and checks both public readiness URLs. If a safeguard refuses
+the update, inspect the cause instead of removing the policy to force it through.
 
 ## Operator verification
 
