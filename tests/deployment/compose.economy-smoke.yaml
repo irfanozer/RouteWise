@@ -1,0 +1,23 @@
+# Isolated CI storage and loopback-only listener; never targets AWS data.
+services:
+  postgres:
+    volumes:
+      - type: volume
+        source: economy-ci-postgres
+        target: /var/lib/postgresql/data
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    environment:
+      ROUTEWISE_CORS_ORIGINS: '["http://127.0.0.1:18080"]'
+  api-proxy:
+    networks: [application, origin-proxy, ci-runner]
+    ports:
+      - "127.0.0.1:18080:8080"
+networks:
+  ci-runner:
+    driver: bridge
+    internal: false
+volumes:
+  economy-ci-postgres:

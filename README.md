@@ -11,8 +11,10 @@ a train line slows down, or an elevator stops working. It shows both routes on
 a map, explains the difference, and saves the calculation so it can be inspected
 and replayed.
 
-The public demo is live on **AWS**. Azure deployment files remain in the
-repository as an alternative.
+The public demo is live on **AWS**. The [cost-optimized AWS option](docs/AWS_ECONOMY.md)
+uses a smaller server with tested memory limits while retaining CloudFormation,
+CloudFront, private S3, PostgreSQL and automated releases. The original AWS
+deployment and all Azure deployment files remain available as alternatives.
 
 ## Try the demo
 
@@ -101,13 +103,19 @@ part of this deployment.
 A push to `main` runs application CI and AWS deployment-asset checks. The image
 workflow publishes matching immutable backend and frontend images to GHCR.
 
-When `AWS_DEPLOYMENT_ENABLED=true`, the AWS workflow checks that the exact
+When `AWS_ECONOMY_DEPLOYMENT_ENABLED=true` and `AWS_DEPLOYMENT_ENABLED=false`,
+the economy workflow additionally requires its isolated, memory-limited runtime
+checks before publishing. The guarded infrastructure resize is a separate
+operator action; a normal application release never resizes the server.
+
+For the preserved original profile, when `AWS_DEPLOYMENT_ENABLED=true`, the AWS workflow checks that the exact
 commit passed application CI and AWS deployment-asset checks, obtains temporary
 AWS credentials through GitHub OIDC, and deploys through Systems Manager.
 It also uploads the matching frontend to S3,
 refreshes CloudFront, and checks the public application.
 
-- [AWS setup, certificates, releases, backups, and costs](docs/AWS_DEPLOYMENT.md)
+- [Cost-optimized AWS profile, savings, and rollback](docs/AWS_ECONOMY.md)
+- [Original AWS setup, certificates, releases, backups, and costs](docs/AWS_DEPLOYMENT.md)
 - [Azure setup and custom domains](docs/DEPLOYMENT.md)
 - [Component boundaries and routing design](docs/ARCHITECTURE.md)
 
